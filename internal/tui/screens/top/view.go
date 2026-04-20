@@ -1,0 +1,472 @@
+package top
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/systalyze/utilyze/internal/format"
+	"github.com/systalyze/utilyze/internal/tui/components/tschart"
+	"github.com/systalyze/utilyze/internal/version"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
+)
+
+const headerLogo = "⣴⠟⠛⠢⣄⣠⠔⠛⠻⣦\n⠻⣦⣤⠴⠋⠙⠦⣤⣴⠟"
+
+const (
+	computeSeries = "compute"
+	memorySeries  = "memory"
+
+	nvlinkSeries = "nvlink"
+	pcieSeries   = "pcie"
+
+	headerSegmentGap = "  "
+)
+
+const bytesSIWidth = 5
+
+func clipFrame(width int, content string) string {
+	if width <= 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	for i := range lines {
+		lines[i] = ansi.Truncate(lines[i], width, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) View() tea.View {
+	if m.quitting {
+		return tea.NewView("")
+	}
+
+	if m.err != nil {
+		banner := lipgloss.JoinHorizontal(lipgloss.Top, m.styles.Spinner.Render("✗ "), m.err.Error())
+		view := tea.NewView(clipFrame(m.width, lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, banner)))
+		view.AltScreen = true
+		return view
+	}
+
+	if !m.initialized {
+		banner := lipgloss.JoinHorizontal(lipgloss.Top, m.spinner.View(), " Initializing...")
+		view := tea.NewView(clipFrame(m.width, lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, banner)))
+		view.AltScreen = true
+		return view
+	}
+
+	if len(m.solCharts) == 0 {
+		banner := m.styles.HeaderLabel.Render("No devices found")
+		view := tea.NewView(clipFrame(m.width, lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, banner)))
+		view.AltScreen = true
+		return view
+	}
+
+	l := m.calcLayout(len(m.solCharts), m.width, m.height)
+
+	gridCols := make([]string, 0, l.gridCols)
+	maxColHeight := 0
+	for c := 0; c < l.gridCols; c++ {
+		var parts []string
+		colWidth := l.gridCellWidth
+		if c == l.gridCols-1 {
+			colWidth += l.gridWidthRemainder
+		}
+
+		for idx := c; idx < len(m.solCharts); idx += l.gridCols {
+			header := m.solChartHeaderView(idx, l.gridPrefixWidth, colWidth, l.twoLine)
+			parts = append(parts, header, m.solCharts[idx].View())
+		}
+
+		chartWidth := colWidth + l.gridPrefixWidth
+		col := m.styles.ChartPanel.Width(chartWidth).Height(1).Render("")
+		if len(parts) > 0 {
+			col = lipgloss.JoinVertical(lipgloss.Left, parts...)
+		}
+
+		gridCols = append(gridCols, col)
+		if h := lipgloss.Height(col); h > maxColHeight {
+			maxColHeight = h
+		}
+	}
+
+	for i := range gridCols {
+		paddingHeight := maxColHeight - lipgloss.Height(gridCols[i])
+		if paddingHeight > 0 {
+			colWidth := lipgloss.Width(gridCols[i])
+			gridCols[i] = lipgloss.JoinVertical(
+				lipgloss.Left,
+				gridCols[i],
+				m.styles.ChartPanel.Width(colWidth).Height(paddingHeight).Render(""),
+			)
+		}
+	}
+
+	grid := lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.solHeaderView(),
+		lipgloss.JoinHorizontal(lipgloss.Top, gridCols...),
+	)
+	var bandwidth string
+	if m.showBandwidth {
+		bandwidth = lipgloss.JoinVertical(lipgloss.Left, m.bandwidthChartHeaderView(), m.bandwidthChart.View())
+	}
+	body := lipgloss.JoinVertical(lipgloss.Left, grid, bandwidth, m.hotkeyBarView())
+	logo := m.headerLogoView()
+	body = lipgloss.NewCompositor(
+		lipgloss.NewLayer(body),
+		lipgloss.NewLayer(logo).X(max(m.width-lipgloss.Width(logo), 0)).Y(0).Z(1),
+	).Render()
+	view := tea.NewView(clipFrame(m.width, body))
+	view.AltScreen = true
+	return view
+}
+
+func (m model) headerBar(totalWidth int, inner string) string {
+	return m.styles.Header.Width(totalWidth).MaxWidth(totalWidth).Align(lipgloss.Left).Render(inner)
+}
+
+func (m model) headerLogoView() string {
+	top, bottom, _ := strings.Cut(headerLogo, "\n")
+	gap := m.styles.Header.Render(" ")
+	line1 := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		m.styles.HeaderBold.Render("SYSTALYZE"),
+		gap,
+		m.styles.HeaderLabel.Render(top),
+		gap,
+	)
+	line2 := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		m.styles.HeaderSecondary.Render("utilyze v"+version.VERSION),
+		gap,
+		m.styles.HeaderLabel.Render(bottom),
+		gap,
+	)
+	width := max(lipgloss.Width(line1), lipgloss.Width(line2))
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.styles.Header.Width(width).Align(lipgloss.Right).Render(line1),
+		m.styles.Header.Width(width).Align(lipgloss.Right).Render(line2),
+	)
+}
+
+func (m model) solHeaderView() string {
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.headerBar(m.width, m.solHeaderInner()),
+		m.headerBar(m.width, ""),
+	)
+}
+
+func (m model) solHeaderInner() string {
+	name, ceiling, uniform := m.uniformAttribution()
+
+	gap := m.styles.HeaderLabel.Render(" ")
+	parts := []string{gap}
+	if m.seriesEnabled(computeSeries) {
+		parts = append(parts,
+			m.styles.Compute.Inherit(m.styles.Header).Render(" ■"),
+			m.styles.HeaderLabel.Render(" Compute SOL%"),
+		)
+	}
+	if m.seriesEnabled(memorySeries) {
+		if len(parts) > 1 {
+			parts = append(parts, gap)
+		}
+		parts = append(parts,
+			m.styles.Memory.Inherit(m.styles.Header).Render("■"),
+			m.styles.HeaderLabel.Render(" Memory SOL%"),
+		)
+	}
+	if uniform && ceiling != nil && m.seriesEnabled(computeSeries) {
+		parts = append(parts,
+			gap,
+			m.styles.ComputeCeiling.Inherit(m.styles.Header).Render("■"),
+			m.styles.HeaderLabel.Render(" Attainable Compute SOL% "),
+			m.styles.ComputeCeiling.Inherit(m.styles.Header).Render(fmt.Sprintf("[%.0f%%]", *ceiling)),
+		)
+	}
+	if uniform && name != nil {
+		parts = append(parts, gap, m.styles.HeaderSecondary.Render(*name))
+	}
+	return m.headerBar(m.width, lipgloss.JoinHorizontal(lipgloss.Top, parts...))
+}
+
+// uniformAttribution returns (modelName, computeCeiling, true) when every
+// monitored GPU has the same model name and compute ceiling.
+func (m model) uniformAttribution() (*string, *float64, bool) {
+	if len(m.deviceIDs) == 0 {
+		return nil, nil, false
+	}
+	var firstName string
+	var firstCeil float64
+	haveFirst := false
+	for _, id := range m.deviceIDs {
+		g, ok := m.gpuCeilings[id]
+		if !ok || g.ModelName == nil || g.ComputeSolCeiling == nil {
+			return nil, nil, false
+		}
+		if !haveFirst {
+			firstName, firstCeil = *g.ModelName, *g.ComputeSolCeiling
+			haveFirst = true
+			continue
+		}
+		if firstName != *g.ModelName || firstCeil != *g.ComputeSolCeiling {
+			return nil, nil, false
+		}
+	}
+	if !haveFirst {
+		return nil, nil, false
+	}
+	return &firstName, &firstCeil, true
+}
+
+func (m model) headerMetricsPart(deviceIdx int) string {
+	dot := m.styles.DotOffline
+	if m.online[deviceIdx] {
+		dot = m.styles.DotOnline
+	}
+
+	physicalID := deviceIdx
+	if deviceIdx < len(m.deviceIDs) {
+		physicalID = m.deviceIDs[deviceIdx]
+	}
+
+	parts := []string{
+		m.styles.HeaderBold.Render(fmt.Sprintf("GPU %d ", physicalID)),
+		dot,
+	}
+	if m.seriesEnabled(computeSeries) {
+		parts = append(parts,
+			m.styles.Compute.Inherit(m.styles.Header).Render(fmt.Sprintf("%s%4.1f%%", headerSegmentGap, m.computeLastValues[deviceIdx])))
+	}
+	if m.seriesEnabled(memorySeries) {
+		parts = append(parts,
+			m.styles.Memory.Inherit(m.styles.Header).Render(fmt.Sprintf("%s%4.1f%%", headerSegmentGap, m.memoryLastValues[deviceIdx])))
+	}
+
+	if _, _, uniform := m.uniformAttribution(); !uniform {
+		if g, ok := m.gpuCeilings[physicalID]; ok && g.ModelName != nil && g.ComputeSolCeiling != nil {
+			parts = append(parts,
+				m.styles.ComputeCeiling.Inherit(m.styles.Header).Render(
+					fmt.Sprintf(" [%.0f%%]", *g.ComputeSolCeiling)))
+		}
+	}
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+}
+
+func (m model) headerModelText(deviceIdx int) string {
+	physicalID := deviceIdx
+	if deviceIdx < len(m.deviceIDs) {
+		physicalID = m.deviceIDs[deviceIdx]
+	}
+	if _, _, uniform := m.uniformAttribution(); uniform {
+		return ""
+	}
+	g, ok := m.gpuCeilings[physicalID]
+	if !ok || g.ModelName == nil {
+		return ""
+	}
+	return *g.ModelName
+}
+
+func (m model) headerModelPart(deviceIdx, width int, inline bool) string {
+	model := m.headerModelText(deviceIdx)
+	if model == "" || width <= 0 {
+		return ""
+	}
+	if inline {
+		model = headerSegmentGap + model
+	}
+	return m.styles.HeaderSecondary.Render(ansi.Truncate(model, width, "..."))
+}
+
+func (m model) solChartHeaderView(deviceIdx, prefixWidth, width int, twoLine bool) string {
+	prefix := m.headerBar(prefixWidth, "")
+	metrics := m.headerMetricsPart(deviceIdx)
+	if !twoLine {
+		model := m.headerModelPart(deviceIdx, max(width-lipgloss.Width(metrics), 0), true)
+		return lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			prefix,
+			m.headerBar(width, lipgloss.JoinHorizontal(lipgloss.Top, metrics, model)),
+		)
+	}
+	model := m.headerModelPart(deviceIdx, width, false)
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.JoinHorizontal(lipgloss.Top, prefix, m.headerBar(width, metrics)),
+		lipgloss.JoinHorizontal(lipgloss.Top, prefix, m.headerBar(width, model)),
+	)
+}
+
+func (m model) bandwidthChartHeaderView() string {
+	return m.headerBar(m.width,
+		lipgloss.JoinHorizontal(lipgloss.Top,
+			m.styles.HeaderBold.Render(" Bandwidth  "),
+			m.styles.PCIe.Inherit(m.styles.Header).Render("■"),
+			m.styles.HeaderLabel.Render(fmt.Sprintf(" PCIe %sB/s  ", format.SI(m.pcieLastValue, bytesSIWidth))),
+			m.styles.NVLink.Inherit(m.styles.Header).Render("■"),
+			m.styles.HeaderLabel.Render(fmt.Sprintf(" NVLink %sB/s", format.SI(m.nvlinkLastValue, bytesSIWidth))),
+		))
+}
+
+func (m model) hotkeyBarView() string {
+	hotkey := func(active lipgloss.Style, enabled bool, key string) string {
+		style := active.Inherit(m.styles.HeaderBold)
+		if !enabled {
+			style = lipgloss.NewStyle().Inherit(m.styles.HeaderBold).Foreground(m.styles.Palette.Subtle)
+		}
+		return style.Render(fmt.Sprintf(" %s ", key))
+	}
+
+	return m.headerBar(m.width,
+		lipgloss.JoinHorizontal(lipgloss.Top,
+			m.styles.HeaderBold.Render(fmt.Sprintf(" %s ", keyQuit)),
+			m.styles.HeaderSecondary.Render("quit "),
+			m.styles.HeaderBold.Render(fmt.Sprintf(" %s ", keyPause)),
+			m.styles.HeaderSecondary.Render("pause "),
+			m.styles.HeaderBold.Render(fmt.Sprintf(" %s ", keyReset)),
+			m.styles.HeaderSecondary.Render("reset "),
+			hotkey(m.styles.Compute, m.seriesEnabled(computeSeries), keyCompute),
+			m.styles.HeaderSecondary.Render("comp "),
+			hotkey(m.styles.Memory, m.seriesEnabled(memorySeries), keyMemory),
+			m.styles.HeaderSecondary.Render("mem "),
+			hotkey(m.styles.PCIe, m.seriesEnabled(pcieSeries), keyPcie),
+			m.styles.HeaderSecondary.Render("pcie "),
+			hotkey(m.styles.NVLink, m.seriesEnabled(nvlinkSeries), keyNvlink),
+			m.styles.HeaderSecondary.Render("nvlink "),
+			hotkey(m.styles.PCIe, m.showBandwidth, keyHideBandwidth),
+			m.styles.HeaderSecondary.Render("toggle bandwidth "),
+		))
+}
+
+func (m model) formatTimeSince(chart *tschart.Model, _ float64, index, n int) string {
+	if n <= 1 || index == n-1 {
+		return "now"
+	}
+	ago := chart.TimeRange() * time.Duration(n-1-index) / time.Duration(n-1)
+	return format.HumanDuration(ago)
+}
+
+type layout struct {
+	gridPrefixWidth    int
+	gridCols           int
+	gridCellWidth      int
+	gridCellHeight     int
+	gridWidthRemainder int
+
+	bandwidthWidth  int
+	bandwidthHeight int
+
+	twoLine bool
+}
+
+func (m model) calcLayout(numCharts int, width int, height int) layout {
+	if !m.ready() {
+		return layout{}
+	}
+
+	solAxisWidth := m.solCharts[0].YAxisWidth()
+	bwAxisWidth := m.bandwidthChart.YAxisWidth()
+
+	var cols int
+	switch {
+	case numCharts == 1:
+		cols = 1
+	case width < 120 || numCharts <= 4:
+		cols = 2
+	default:
+		cols = 4
+	}
+	rows := (numCharts + cols - 1) / cols
+
+	gridWidth := width - cols*solAxisWidth
+	gridCellWidth := max(gridWidth/cols, 1)
+	gridWidthRemainder := max(gridWidth-gridCellWidth*cols, 0)
+
+	twoLine := false
+	for idx := 0; idx < numCharts; idx++ {
+		model := m.headerModelText(idx)
+		if model == "" {
+			continue
+		}
+		c := idx % cols
+		colWidth := gridCellWidth
+		if c == cols-1 {
+			colWidth += gridWidthRemainder
+		}
+		if lipgloss.Width(m.headerMetricsPart(idx))+lipgloss.Width(headerSegmentGap+model) > colWidth {
+			twoLine = true
+			break
+		}
+	}
+
+	solChartHeaderLinesPerRow := 1
+	if twoLine {
+		solChartHeaderLinesPerRow = 2
+	}
+
+	const solHeaderLines = 2
+	const bandwidthHeaderLines = 1
+	const hotkeyLines = 1
+	overheadLines := solHeaderLines + solChartHeaderLinesPerRow*rows + hotkeyLines
+	if m.showBandwidth {
+		overheadLines += bandwidthHeaderLines
+	}
+
+	innerHeight := max(height-overheadLines, 1)
+
+	bwHeight := 0
+	gridInnerHeight := innerHeight
+	if m.showBandwidth {
+		bwHeight = max(innerHeight*20/100, 0)
+		gridInnerHeight = max(innerHeight-bwHeight, 1)
+	}
+	gridCellHeight := max(gridInnerHeight/rows, 1)
+	gridHeightRemainder := max(gridInnerHeight-gridCellHeight*rows, 0)
+	bwHeight += gridHeightRemainder
+
+	bwWidth := max(width-bwAxisWidth, 1)
+
+	return layout{
+		gridPrefixWidth:    solAxisWidth,
+		gridCols:           cols,
+		gridCellWidth:      gridCellWidth,
+		gridCellHeight:     gridCellHeight,
+		gridWidthRemainder: gridWidthRemainder,
+
+		bandwidthWidth:  bwWidth,
+		bandwidthHeight: bwHeight,
+
+		twoLine: twoLine,
+	}
+}
+
+func (m *model) applyLayout() {
+	if !m.ready() {
+		return
+	}
+
+	l := m.calcLayout(len(m.solCharts), m.width, m.height)
+	for idx, chart := range m.solCharts {
+		if chart == nil {
+			continue
+		}
+		isLastChartInColumn := idx+l.gridCols >= len(m.solCharts)
+		chart.EnableAxes(isLastChartInColumn, true)
+		colWidth := l.gridCellWidth
+		isLastColumn := idx%l.gridCols == l.gridCols-1
+		if isLastColumn {
+			colWidth += l.gridWidthRemainder
+		}
+		chart.Resize(colWidth, l.gridCellHeight)
+	}
+	m.bandwidthChart.Resize(l.bandwidthWidth, l.bandwidthHeight)
+}

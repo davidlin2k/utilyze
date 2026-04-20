@@ -1,0 +1,192 @@
+package top
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/systalyze/utilyze/internal/format"
+	"github.com/systalyze/utilyze/internal/theme"
+	"github.com/systalyze/utilyze/internal/tui/components/spinner"
+	"github.com/systalyze/utilyze/internal/tui/components/tschart"
+
+	tea "charm.land/bubbletea/v2"
+)
+
+type model struct {
+	solChartTimeRange       time.Duration
+	bandwidthChartTimeRange time.Duration
+	drawInterval            time.Duration
+	resolution              time.Duration
+
+	initialized bool
+
+	width  int
+	height int
+
+	spinner spinner.Model
+
+	err error
+
+	enabledSeries []string
+
+	deviceIDs         []int
+	deviceIndexMap    map[int]int // physical device ID → chart index
+	solCharts         []*tschart.Model
+	online            []bool
+	memoryLastValues  []float64
+	computeLastValues []float64
+
+	bandwidthChart  *tschart.Model
+	nvlinkLastValue float64
+	pcieLastValue   float64
+
+	paused        bool
+	pausedAt      time.Time
+	quitting      bool
+	showBandwidth bool
+
+	gpuCeilings map[int]GpuCeiling
+
+	styles theme.Styles
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(m.spinner.Tick, tea.RequestBackgroundColor)
+}
+
+type drawMsg struct{}
+
+func (m model) tick() tea.Cmd {
+	return tea.Tick(m.drawInterval, func(t time.Time) tea.Msg {
+		return drawMsg{}
+	})
+}
+
+func (m model) ready() bool {
+	return m.initialized && len(m.solCharts) > 0 && m.bandwidthChart != nil
+}
+
+func (m *model) initCharts(deviceIDs []int) {
+	numDevices := len(deviceIDs)
+	m.deviceIDs = deviceIDs
+	m.deviceIndexMap = make(map[int]int, numDevices)
+	for i, id := range deviceIDs {
+		m.deviceIndexMap[id] = i
+	}
+	m.solCharts = make([]*tschart.Model, numDevices)
+	now := time.Now()
+	for i := 0; i < numDevices; i++ {
+		m.solCharts[i] = tschart.New(m.width, m.height,
+			tschart.WithResolution(m.resolution),
+			tschart.WithXTicks(6),
+			tschart.WithXTickFormatter(m.formatTimeSince),
+			tschart.WithYRange(0, 100),
+			tschart.WithYTicks(5),
+			tschart.WithYTickFormatter(func(chart *tschart.Model, v float64, index int, n int) string {
+				return fmt.Sprintf("%2d", index*100/(n-1))
+			}),
+			tschart.WithStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel))
+		m.solCharts[i].SetSeriesStyle(computeSeries, m.styles.Compute.Inherit(m.styles.ChartPanel))
+		m.solCharts[i].SetSeriesStyle(memorySeries, m.styles.Memory.Inherit(m.styles.ChartPanel))
+		m.solCharts[i].Push(computeSeries, now, 0) // start all charts at the same time
+		m.solCharts[i].Push(memorySeries, now, 0)
+	}
+
+	m.bandwidthChart = tschart.New(
+		m.width, m.height,
+		tschart.WithAutoScale(),
+		tschart.WithResolution(m.resolution),
+		tschart.WithXTicks(3),
+		tschart.WithXTickFormatter(m.formatTimeSince),
+		tschart.WithYRange(0, 0.5e9),
+		tschart.WithYTicks(3),
+		tschart.WithYTickFormatter(func(chart *tschart.Model, v float64, index int, n int) string {
+			return format.SI(v, bytesSIWidth)
+		}),
+		tschart.WithStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel))
+	m.bandwidthChart.EnableAxes(true, true)
+	m.bandwidthChart.SetSeriesStyle(nvlinkSeries, m.styles.NVLink.Inherit(m.styles.ChartPanel))
+	m.bandwidthChart.SetSeriesStyle(pcieSeries, m.styles.PCIe.Inherit(m.styles.ChartPanel))
+	m.bandwidthChart.Push(nvlinkSeries, now, 0)
+	m.bandwidthChart.Push(pcieSeries, now, 0)
+
+	m.computeLastValues = make([]float64, numDevices)
+	m.memoryLastValues = make([]float64, numDevices)
+	m.online = make([]bool, numDevices)
+}
+
+func (m model) draw() {
+	now := time.Now()
+	if m.paused && !m.pausedAt.IsZero() {
+		now = m.pausedAt
+	}
+	for _, chart := range m.solCharts {
+		chart.Draw(m.enabledSeries, now)
+		chart.Invalidate()
+	}
+	m.bandwidthChart.Draw(m.enabledSeries, now)
+	m.bandwidthChart.Invalidate()
+}
+
+func (m *model) applyCeilingThresholds() {
+	for i, chart := range m.solCharts {
+		if chart == nil || i >= len(m.deviceIDs) {
+			continue
+		}
+		var thresholds []tschart.ThresholdLine
+		if g, ok := m.gpuCeilings[m.deviceIDs[i]]; ok && g.ComputeSolCeiling != nil {
+			thresholds = append(thresholds, tschart.ThresholdLine{
+				Value: *g.ComputeSolCeiling,
+				Style: m.styles.ComputeCeiling.Inherit(m.styles.ChartPanel),
+			})
+		}
+		chart.SetThresholds(thresholds)
+	}
+}
+
+func (m *model) resetCharts() {
+	for _, chart := range m.solCharts {
+		chart.Reset()
+	}
+	m.bandwidthChart.Reset()
+	m.applyTheme()
+}
+
+func (m *model) applyTheme() {
+	m.spinner = spinner.New(&m.styles.Spinner)
+
+	for _, chart := range m.solCharts {
+		if chart == nil {
+			continue
+		}
+		chart.SetStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel)
+		chart.SetSeriesStyle(computeSeries, m.styles.Compute.Inherit(m.styles.ChartPanel))
+		chart.SetSeriesStyle(memorySeries, m.styles.Memory.Inherit(m.styles.ChartPanel))
+	}
+
+	if m.bandwidthChart != nil {
+		m.bandwidthChart.SetStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel)
+		m.bandwidthChart.SetSeriesStyle(nvlinkSeries, m.styles.NVLink.Inherit(m.styles.ChartPanel))
+		m.bandwidthChart.SetSeriesStyle(pcieSeries, m.styles.PCIe.Inherit(m.styles.ChartPanel))
+	}
+
+	m.applyCeilingThresholds()
+}
+
+func New(w int, h int, opts ...Option) model {
+	m := model{
+		width:         max(w, 1),
+		height:        max(h, 1),
+		drawInterval:  100 * time.Millisecond,
+		resolution:    200 * time.Millisecond,
+		showBandwidth: true,
+
+		styles:        theme.NewStyles(true),
+		enabledSeries: []string{computeSeries, memorySeries, nvlinkSeries, pcieSeries},
+	}
+	m.spinner = spinner.New(&m.styles.Spinner)
+	for _, opt := range opts {
+		opt(&m)
+	}
+	return m
+}
