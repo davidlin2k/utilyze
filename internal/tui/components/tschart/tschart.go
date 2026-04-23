@@ -45,6 +45,8 @@ type Model struct {
 	AxisStyle   lipgloss.Style
 	PanelStyle  lipgloss.Style
 
+	PlainLines bool
+
 	width, height    int
 	canvasW, canvasH int
 
@@ -59,9 +61,11 @@ type Model struct {
 	series     map[string]*series
 	styleANSI  map[string][2]string // lookup table for ANSI codes of series styles to prevent lipgloss.Render calls
 
-	grids          map[string]*brailleGrid
-	thresholds     []ThresholdLine
-	thresholdGrids []*brailleGrid
+	grids              map[string]*brailleGrid
+	lineGrids          map[string]*lineGrid
+	thresholds         []ThresholdLine
+	thresholdGrids     []*brailleGrid
+	thresholdLineGrids []*lineGrid
 
 	chartCache        string
 	yaxisCache        string
@@ -184,6 +188,14 @@ func (m *Model) Resize(width, height int) {
 }
 
 func (m *Model) buildGrids() {
+	if m.PlainLines {
+		m.lineGrids = make(map[string]*lineGrid)
+		for name := range m.series {
+			g := newLineGrid(m.canvasW, m.canvasH)
+			m.lineGrids[name] = &g
+		}
+		return
+	}
 	m.grids = make(map[string]*brailleGrid)
 	for name := range m.series {
 		g := newBrailleGrid(m.canvasW, m.canvasH)
@@ -212,12 +224,14 @@ func (m *Model) buildStyleANSITable() {
 	}
 }
 
-// tickRow returns the canvas row for a Y-axis tick at the given tick percentage
 func (m *Model) tickRow(pct float64) int {
-	graphH := m.canvasH * 4
-	if graphH <= 1 {
+	if m.canvasH <= 1 {
 		return 0
 	}
+	if m.PlainLines {
+		return int(math.Round((1 - pct) * float64(m.canvasH-1)))
+	}
+	graphH := m.canvasH * 4
 	graphY := int(math.Round((1 - pct) * float64(graphH-1)))
 	return graphY / 4
 }
@@ -232,7 +246,18 @@ func (m *Model) ensureBrailleGrid(seriesName string) {
 	}
 }
 
-// Draw renders the chart for the given series names and current time in series name order (first is lowest layer).
+func (m *Model) ensureLineGrid(seriesName string) {
+	if m.lineGrids == nil {
+		m.lineGrids = make(map[string]*lineGrid)
+	}
+	if m.lineGrids[seriesName] == nil {
+		g := newLineGrid(m.canvasW, m.canvasH)
+		m.lineGrids[seriesName] = &g
+	}
+}
+
+// Draw renders the chart for the given series names and current time.
+// The first name in seriesNames is the topmost layer (first non-empty cell wins).
 func (m *Model) Draw(seriesNames []string, now time.Time) {
 	m.seriesRenderCache = slices.Clone(seriesNames)
 	windowStart := now.Add(-m.TimeRange())
@@ -244,6 +269,25 @@ func (m *Model) Draw(seriesNames []string, now time.Time) {
 		m.xaxisCache = m.renderXAxis()
 		m.buildThresholdGrids()
 		m.viewDirty = true
+	}
+
+	if m.PlainLines {
+		for _, g := range m.lineGrids {
+			g.clear()
+		}
+		graphW := m.canvasW
+		for _, name := range seriesNames {
+			s := m.series[name]
+			if s == nil || len(s.samples) == 0 {
+				continue
+			}
+			if values := m.resample(s, windowStart, now, graphW); values != nil {
+				m.ensureLineGrid(name)
+				m.lineGrids[name].drawValues(values, yRange[0], yRange[1])
+			}
+		}
+		m.chartCache = m.renderChart(seriesNames)
+		return
 	}
 
 	for _, g := range m.grids {
@@ -272,7 +316,13 @@ func (m *Model) renderChart(seriesNames []string) string {
 	if m.canvasW <= 0 || m.canvasH <= 0 {
 		return ""
 	}
+	if m.PlainLines {
+		return m.renderChartPlain(seriesNames)
+	}
+	return m.renderChartBraille(seriesNames)
+}
 
+func (m *Model) renderChartBraille(seriesNames []string) string {
 	var buf strings.Builder
 	buf.Grow(m.canvasW * m.canvasH * 6)
 
@@ -347,6 +397,65 @@ func (m *Model) renderChart(seriesNames []string) string {
 	return buf.String()
 }
 
+func (m *Model) renderChartPlain(seriesNames []string) string {
+	var buf strings.Builder
+	buf.Grow(m.canvasW * m.canvasH * 6)
+
+	for y := range m.canvasH {
+		if y > 0 {
+			buf.WriteByte('\n')
+		}
+		prevKey := ""
+		for x := range m.canvasW {
+			var glyph rune
+			styleKey := panelAnsiKey
+
+			for _, name := range seriesNames {
+				g := m.lineGrids[name]
+				if g == nil {
+					continue
+				}
+				if r := g.runeAt(x, y); r != 0 {
+					glyph = r
+					styleKey = name
+					break
+				}
+			}
+
+			if glyph == 0 {
+				for i, tg := range m.thresholdLineGrids {
+					if tg == nil {
+						continue
+					}
+					if r := tg.runeAt(x, y); r != 0 {
+						glyph = r
+						styleKey = fmt.Sprintf("_threshold_%d", i)
+						break
+					}
+				}
+			}
+
+			if styleKey != prevKey {
+				if prevKey != "" {
+					buf.WriteString(m.styleANSI[prevKey][1])
+				}
+				buf.WriteString(m.styleANSI[styleKey][0])
+				prevKey = styleKey
+			}
+
+			if glyph == 0 {
+				buf.WriteByte(' ')
+			} else {
+				buf.WriteRune(glyph)
+			}
+		}
+		if prevKey != "" {
+			buf.WriteString(m.styleANSI[prevKey][1])
+		}
+	}
+	return buf.String()
+}
+
 func (m *Model) EnableAxes(xaxis, yaxis bool) {
 	if m.xaxis == xaxis && m.yaxis == yaxis {
 		return
@@ -386,6 +495,27 @@ func (m *Model) SetThresholds(thresholds []ThresholdLine) {
 }
 
 func (m *Model) buildThresholdGrids() {
+	if m.PlainLines {
+		m.thresholdLineGrids = make([]*lineGrid, len(m.thresholds))
+		if m.canvasW <= 0 || m.canvasH <= 0 {
+			return
+		}
+		for i, threshold := range m.thresholds {
+			grid := newLineGrid(m.canvasW, m.canvasH)
+			m.thresholdLineGrids[i] = &grid
+
+			yRange := m.renderYRange
+			span := yRange[1] - yRange[0]
+			if span <= 0 {
+				continue
+			}
+			normalized := clamp01((threshold.Value - yRange[0]) / span)
+			row := int(math.Round(clamp01(1-normalized) * float64(grid.canvasH-1)))
+			grid.fillRow(row)
+		}
+		return
+	}
+
 	m.thresholdGrids = make([]*brailleGrid, len(m.thresholds))
 	if m.canvasW <= 0 || m.canvasH <= 0 {
 		return

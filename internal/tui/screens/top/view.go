@@ -344,6 +344,8 @@ func (m model) hotkeyBarView() string {
 			m.styles.HeaderSecondary.Render("nvlink "),
 			hotkey(m.styles.PCIe, m.showBandwidth, keyHideBandwidth),
 			m.styles.HeaderSecondary.Render("toggle bandwidth "),
+			hotkey(m.styles.HeaderBold, m.highContrast, keyHighContrast),
+			m.styles.HeaderSecondary.Render("toggle high contrast "),
 		))
 }
 

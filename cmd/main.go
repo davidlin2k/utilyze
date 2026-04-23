@@ -164,7 +164,12 @@ func run(ctx context.Context, deviceIds []int) error {
 		w, h = 80, 24
 	}
 
-	screen := top.New(w, h, top.WithRefreshInterval(refreshInterval), top.WithResolution(resolution))
+	highContrast := os.Getenv("UTLZ_HIGH_CONTRAST") != "0"
+	screen := top.New(w, h,
+		top.WithRefreshInterval(refreshInterval),
+		top.WithResolution(resolution),
+		top.WithHighContrast(highContrast),
+	)
 	p := tea.NewProgram(screen, tea.WithContext(ctx))
 
 	go func() {

@@ -4,8 +4,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/systalyze/utilyze/internal/theme"
-
 	tea "charm.land/bubbletea/v2"
 )
 
@@ -18,12 +16,13 @@ const (
 	keyNvlink        = "n"
 	keyPcie          = "p"
 	keyHideBandwidth = "b"
+	keyHighContrast  = "h"
 )
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch typedMsg := msg.(type) {
 	case tea.BackgroundColorMsg:
-		m.styles = theme.NewStyles(typedMsg.IsDark())
+		m.dark = typedMsg.IsDark()
 		m.applyTheme()
 		if !m.initialized {
 			return m, m.spinner.Tick
@@ -63,6 +62,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case keyHideBandwidth:
 			m.showBandwidth = !m.showBandwidth
 			m.applyLayout()
+			return m, m.beginDraw()
+		case keyHighContrast:
+			m.highContrast = !m.highContrast
+			m.applyTheme()
 			return m, m.beginDraw()
 		default:
 			return m, nil

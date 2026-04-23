@@ -21,8 +21,20 @@ type Styles struct {
 	DotOnline       string
 }
 
-func NewStyles(dark bool) Styles {
+func NewStyles(dark, highContrast bool) Styles {
 	palette := NewPalette(dark)
+
+	borderFg := palette.Subtle
+	axisFg := palette.Subtle
+	computeFg := palette.Compute
+	memoryFg := palette.Memory
+	if highContrast {
+		white := lipgloss.Color("15")
+		borderFg = white
+		axisFg = white
+		computeFg = lipgloss.Color("#00D7FF")
+		memoryFg = lipgloss.Color("#FF5F00")
+	}
 
 	header := lipgloss.NewStyle().
 		Background(palette.Surface).
@@ -39,13 +51,13 @@ func NewStyles(dark bool) Styles {
 		HeaderLabel:     lipgloss.NewStyle().Inherit(header),
 		HeaderSecondary: lipgloss.NewStyle().Inherit(header).Foreground(palette.TextMuted),
 		ChartPanel:      panel,
-		ChartAxis:       lipgloss.NewStyle().Inherit(panel).Foreground(palette.Subtle),
+		ChartAxis:       lipgloss.NewStyle().Inherit(panel).Foreground(axisFg),
 		ChartBorder: lipgloss.NewStyle().Inherit(panel).
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(palette.Subtle).
+			BorderForeground(borderFg).
 			BorderBackground(palette.Panel),
-		Compute:        lipgloss.NewStyle().Foreground(palette.Compute),
-		Memory:         lipgloss.NewStyle().Foreground(palette.Memory),
+		Compute:        lipgloss.NewStyle().Foreground(computeFg),
+		Memory:         lipgloss.NewStyle().Foreground(memoryFg),
 		NVLink:         lipgloss.NewStyle().Foreground(palette.NVLink),
 		PCIe:           lipgloss.NewStyle().Foreground(palette.PCIe),
 		ComputeCeiling: lipgloss.NewStyle().Foreground(palette.ComputeCeiling),

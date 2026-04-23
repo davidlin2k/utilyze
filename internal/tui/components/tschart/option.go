@@ -67,3 +67,9 @@ func (m *Model) SetStyles(borderStyle, axisStyle, panelStyle lipgloss.Style) {
 	m.buildStyleANSITable()
 	m.Resize(m.width, m.height)
 }
+
+func WithPlainLines() Option {
+	return func(m *Model) {
+		m.PlainLines = true
+	}
+}

@@ -47,7 +47,9 @@ type model struct {
 
 	gpuCeilings map[int]GpuCeiling
 
-	styles theme.Styles
+	highContrast bool
+	dark         bool
+	styles       theme.Styles
 }
 
 func (m model) Init() tea.Cmd {
@@ -76,7 +78,7 @@ func (m *model) initCharts(deviceIDs []int) {
 	m.solCharts = make([]*tschart.Model, numDevices)
 	now := time.Now()
 	for i := 0; i < numDevices; i++ {
-		m.solCharts[i] = tschart.New(m.width, m.height,
+		opts := []tschart.Option{
 			tschart.WithResolution(m.resolution),
 			tschart.WithXTicks(6),
 			tschart.WithXTickFormatter(m.formatTimeSince),
@@ -85,15 +87,19 @@ func (m *model) initCharts(deviceIDs []int) {
 			tschart.WithYTickFormatter(func(chart *tschart.Model, v float64, index int, n int) string {
 				return fmt.Sprintf("%2d", index*100/(n-1))
 			}),
-			tschart.WithStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel))
+			tschart.WithStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel),
+		}
+		if m.highContrast {
+			opts = append(opts, tschart.WithPlainLines())
+		}
+		m.solCharts[i] = tschart.New(m.width, m.height, opts...)
 		m.solCharts[i].SetSeriesStyle(computeSeries, m.styles.Compute.Inherit(m.styles.ChartPanel))
 		m.solCharts[i].SetSeriesStyle(memorySeries, m.styles.Memory.Inherit(m.styles.ChartPanel))
 		m.solCharts[i].Push(computeSeries, now, 0) // start all charts at the same time
 		m.solCharts[i].Push(memorySeries, now, 0)
 	}
 
-	m.bandwidthChart = tschart.New(
-		m.width, m.height,
+	bwOpts := []tschart.Option{
 		tschart.WithAutoScale(),
 		tschart.WithResolution(m.resolution),
 		tschart.WithXTicks(3),
@@ -103,7 +109,12 @@ func (m *model) initCharts(deviceIDs []int) {
 		tschart.WithYTickFormatter(func(chart *tschart.Model, v float64, index int, n int) string {
 			return format.SI(v, bytesSIWidth)
 		}),
-		tschart.WithStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel))
+		tschart.WithStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel),
+	}
+	if m.highContrast {
+		bwOpts = append(bwOpts, tschart.WithPlainLines())
+	}
+	m.bandwidthChart = tschart.New(m.width, m.height, bwOpts...)
 	m.bandwidthChart.EnableAxes(true, true)
 	m.bandwidthChart.SetSeriesStyle(nvlinkSeries, m.styles.NVLink.Inherit(m.styles.ChartPanel))
 	m.bandwidthChart.SetSeriesStyle(pcieSeries, m.styles.PCIe.Inherit(m.styles.ChartPanel))
@@ -153,21 +164,26 @@ func (m *model) resetCharts() {
 }
 
 func (m *model) applyTheme() {
+	m.styles = theme.NewStyles(m.dark, m.highContrast)
 	m.spinner = spinner.New(&m.styles.Spinner)
 
 	for _, chart := range m.solCharts {
 		if chart == nil {
 			continue
 		}
+		chart.PlainLines = m.highContrast
 		chart.SetStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel)
 		chart.SetSeriesStyle(computeSeries, m.styles.Compute.Inherit(m.styles.ChartPanel))
 		chart.SetSeriesStyle(memorySeries, m.styles.Memory.Inherit(m.styles.ChartPanel))
+		chart.Invalidate()
 	}
 
 	if m.bandwidthChart != nil {
+		m.bandwidthChart.PlainLines = m.highContrast
 		m.bandwidthChart.SetStyles(m.styles.ChartBorder, m.styles.ChartAxis, m.styles.ChartPanel)
 		m.bandwidthChart.SetSeriesStyle(nvlinkSeries, m.styles.NVLink.Inherit(m.styles.ChartPanel))
 		m.bandwidthChart.SetSeriesStyle(pcieSeries, m.styles.PCIe.Inherit(m.styles.ChartPanel))
+		m.bandwidthChart.Invalidate()
 	}
 
 	m.applyCeilingThresholds()
@@ -180,13 +196,15 @@ func New(w int, h int, opts ...Option) model {
 		drawInterval:  100 * time.Millisecond,
 		resolution:    200 * time.Millisecond,
 		showBandwidth: true,
+		highContrast:  true,
+		dark:          true,
 
-		styles:        theme.NewStyles(true),
 		enabledSeries: []string{computeSeries, memorySeries, nvlinkSeries, pcieSeries},
 	}
-	m.spinner = spinner.New(&m.styles.Spinner)
 	for _, opt := range opts {
 		opt(&m)
 	}
+	m.styles = theme.NewStyles(m.dark, m.highContrast)
+	m.spinner = spinner.New(&m.styles.Spinner)
 	return m
 }
