@@ -10,6 +10,8 @@ Utilyze reads GPU performance counters directly to show what's actually being us
 
 Utilyze is created by [Systalyze](https://systalyze.com).
 
+**Read this in other languages:** [中文](./README.zh-CN.md)
+
 ## Requirements
 
 - Linux amd64 (arm64 support coming soon)
